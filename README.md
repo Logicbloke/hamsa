@@ -15,8 +15,19 @@ using only the speaker and microphone. Hamsa (همسة) is Arabic for "whisper".
 2. On the receiver, tap **Start listening** and allow the microphone.
 3. On the sender, turn the volume up, type a message (up to 120 bytes) and send.
 
-A message takes roughly 1.5 s plus 0.1 s per character. Only one device can
+A message takes roughly 2 s plus 0.1 s per character. Only one device can
 talk at a time; a device ignores its microphone while it is sending.
+
+### Delivery receipts
+
+The receiver answers every message with a short acknowledgement, or with a
+request to repeat it if it arrived garbled. If the sender is listening too, it
+shows **Delivered ✓**, resends up to twice when no acknowledgement comes back,
+and otherwise marks the message **Not delivered**. A sender that is not
+listening cannot hear receipts and shows **Sent, no receipt**.
+
+Receiving phones vibrate on a new message where the browser supports it
+(Android; iOS browsers do not expose vibration).
 
 ### If nothing arrives
 
@@ -24,8 +35,8 @@ talk at a time; a device ignores its microphone while it is sending.
   does not move, the speaker or microphone cannot handle 18-20 kHz; many
   Bluetooth speakers and headsets cannot.
 - Raise the sender's volume and move the devices closer.
-- On iOS, audio may be routed to the quiet earpiece while the microphone is
-  open: stop listening on the sending phone before you send.
+- On iOS, if the microphone prompt never appears, enable Microphone for the
+  browser in the iOS Settings app and reload.
 
 ## How it works
 
@@ -34,7 +45,8 @@ talk at a time; a device ignores its microphone while it is sending.
 | Band | 32 tones, 18.000-20.325 kHz, 75 Hz apart |
 | Modulation | 16-FSK, 40 ms symbols (4 bits each), raised-cosine edges |
 | Echo rejection | even and odd symbols use two interleaved 16-tone sets |
-| Framing | 8-symbol preamble, length header, UTF-8 payload, CRC-16 |
+| Framing | 8-symbol preamble, header (length, message id), UTF-8 payload, CRC-16 |
+| Receipts | header-only ACK / NACK frames carrying the message id |
 | Error correction | Reed-Solomon over GF(256), about one bad byte in eight |
 | Receiver | Goertzel filter bank, preamble search at quarter-symbol hops |
 

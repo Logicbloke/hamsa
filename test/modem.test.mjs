@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { rsEncode, rsDecode } from '../modem/reedsolomon.js';
 import {
-  HEADER_NIBBLES, MAX_BYTES, bodyNibbles, decodeBody, decodeHeader, encodeFrame,
+  HEADER_NIBBLES, MAX_BYTES, bodyNibbles, decodeBody, decodeHeader, encodeControl, encodeFrame,
 } from '../modem/codec.js';
 import { modulate } from '../modem/modulator.js';
 import { Demodulator } from '../modem/demodulator.js';
@@ -21,10 +21,13 @@ function gaussian(rand) {
   return Math.sqrt(-2 * Math.log(rand() + 1e-12)) * Math.cos(2 * Math.PI * rand());
 }
 
-// Run samples through a receiver in microphone-sized blocks.
+// Run samples through a receiver in microphone-sized blocks. Messages are
+// returned as their text, other frames as their type.
 function receive(samples, sampleRate, blockSize = 2048) {
   const frames = [];
-  const demod = new Demodulator(sampleRate, { onFrame: (f) => frames.push(f) });
+  const demod = new Demodulator(sampleRate, {
+    onFrame: (f) => frames.push(f.type === 'message' ? f.text : f.type),
+  });
   for (let i = 0; i < samples.length; i += blockSize) {
     demod.push(samples.subarray(i, i + blockSize));
   }
@@ -69,8 +72,9 @@ test('reed-solomon rejects a codeword with too many errors', () => {
 
 test('codec round-trips text, including multi-byte characters', () => {
   for (const text of ['a', 'hello world', 'héllo wörld 👋 همسة', 'x'.repeat(MAX_BYTES)]) {
-    const frame = encodeFrame(text);
-    const length = decodeHeader(frame.subarray(0, HEADER_NIBBLES));
+    const frame = encodeFrame(text, 201);
+    const { type, id, length } = decodeHeader(frame.subarray(0, HEADER_NIBBLES));
+    assert.deepEqual([type, id], ['message', 201]);
     assert.equal(length, new TextEncoder().encode(text).length);
     assert.equal(frame.length, HEADER_NIBBLES + bodyNibbles(length));
     assert.equal(decodeBody(frame.subarray(HEADER_NIBBLES), length), text);
@@ -85,7 +89,7 @@ test('codec rejects empty and oversized messages', () => {
 test('codec repairs a few bad symbols and rejects a wrecked frame', () => {
   const text = 'the quick brown fox';
   const frame = encodeFrame(text);
-  const length = decodeHeader(frame.subarray(0, HEADER_NIBBLES));
+  const { length } = decodeHeader(frame.subarray(0, HEADER_NIBBLES));
   const body = frame.slice(HEADER_NIBBLES);
   body[3] ^= 5;
   body[20] ^= 9;
@@ -167,7 +171,7 @@ test('a transmission cut off mid-frame is reported as unrecoverable', () => {
   padded.set(audio);
   const rand = rng(3);
   for (let i = audio.length; i < padded.length; i++) padded[i] = 0.001 * gaussian(rand);
-  assert.deepEqual(receive(padded, sr), [null]);
+  assert.deepEqual(receive(padded, sr), ['garbled']);
 });
 
 test('reports sync and progress before the frame', () => {
@@ -176,8 +180,44 @@ test('reports sync and progress before the frame', () => {
   const demod = new Demodulator(sr, {
     onSync: (n) => events.push(['sync', n]),
     onProgress: (f) => events.length < 2 && events.push(['progress', f > 0 && f < 1]),
-    onFrame: (t) => events.push(['frame', t]),
+    onFrame: (f) => events.push(['frame', f]),
   });
-  demod.push(channel(modulate(encodeFrame('hi'), sr), sr, {}));
-  assert.deepEqual(events, [['sync', 2], ['progress', true], ['frame', 'hi']]);
+  demod.push(channel(modulate(encodeFrame('hi', 7), sr), sr, {}));
+  assert.deepEqual(events, [
+    ['sync', 2], ['progress', true], ['frame', { type: 'message', id: 7, text: 'hi' }],
+  ]);
+});
+
+test('header survives two bad bytes and rejects garbage', () => {
+  const header = encodeFrame('hello', 42).slice(0, HEADER_NIBBLES);
+  header[0] ^= 7;
+  header[5] ^= 1;
+  assert.deepEqual(decodeHeader(header), { type: 'message', id: 42, length: 5 });
+  header[8] ^= 3;
+  header[10] ^= 3;
+  assert.notDeepEqual(decodeHeader(header), { type: 'message', id: 42, length: 5 });
+});
+
+test('ack and nack frames carry the message id through noise and echo', () => {
+  const sr = 44100;
+  for (const type of ['ack', 'nack']) {
+    for (let seed = 1; seed <= 5; seed++) {
+      const frames = [];
+      const demod = new Demodulator(sr, { onFrame: (f) => frames.push(f) });
+      demod.push(channel(modulate(encodeControl(type, 37 + seed), sr), sr, {
+        gain: 0.01, noise: 0.02, echoes: [[0.02, 0.5]], seed,
+      }));
+      assert.deepEqual(frames, [{ type, id: 37 + seed }]);
+    }
+  }
+});
+
+test('a message followed by its ack', () => {
+  const sr = 48000;
+  const a = channel(modulate(encodeFrame('ping', 9), sr), sr, {});
+  const b = channel(modulate(encodeControl('ack', 9), sr), sr, {});
+  const audio = new Float32Array(a.length + b.length);
+  audio.set(a);
+  audio.set(b, a.length);
+  assert.deepEqual(receive(audio, sr), ['ping', 'ack']);
 });

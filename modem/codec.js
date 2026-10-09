@@ -1,13 +1,16 @@
 // Text <-> frame symbols (nibbles). A frame is:
-//   header: RS([length])                   3 bytes
+//   header: RS([length, id])               6 bytes
 //   body:   RS(utf8 payload + CRC-16)      length + 2 + bodyParity(length) bytes
+// `id` is the sender's message counter. ACK and NACK frames are a header alone,
+// with a reserved value in place of the length and the id being answered.
 // The preamble is added by the modulator.
 
 import { rsEncode, rsDecode } from './reedsolomon.js';
 
 export const MAX_BYTES = 120;
-const HEADER_PARITY = 2;
-export const HEADER_NIBBLES = 2 * (1 + HEADER_PARITY);
+const HEADER_PARITY = 4;
+export const HEADER_NIBBLES = 2 * (2 + HEADER_PARITY);
+const CONTROL = { ack: 254, nack: 255 };
 
 // Corrects roughly one bad byte in eight.
 function bodyParity(length) {
@@ -48,7 +51,7 @@ export function byteLength(text) {
   return new TextEncoder().encode(text).length;
 }
 
-export function encodeFrame(text) {
+export function encodeFrame(text, id = 0) {
   const payload = new TextEncoder().encode(text);
   if (!payload.length || payload.length > MAX_BYTES) {
     throw new RangeError(`message must be 1-${MAX_BYTES} bytes`);
@@ -58,7 +61,7 @@ export function encodeFrame(text) {
   const crc = crc16(payload);
   body[payload.length] = crc >> 8;
   body[payload.length + 1] = crc & 255;
-  const header = rsEncode(Uint8Array.of(payload.length), HEADER_PARITY);
+  const header = rsEncode(Uint8Array.of(payload.length, id), HEADER_PARITY);
   const coded = rsEncode(body, bodyParity(payload.length));
   const out = new Uint8Array(2 * (header.length + coded.length));
   out.set(toNibbles(header));
@@ -66,11 +69,21 @@ export function encodeFrame(text) {
   return out;
 }
 
-// Returns the payload length, or -1 if the header is unreadable.
+// type is 'ack' or 'nack'; id is the message being answered.
+export function encodeControl(type, id) {
+  return toNibbles(rsEncode(Uint8Array.of(CONTROL[type], id), HEADER_PARITY));
+}
+
+// Returns { type: 'message', id, length }, { type: 'ack' | 'nack', id }, or
+// null if the header is unreadable.
 export function decodeHeader(nibbles) {
   const header = rsDecode(toBytes(nibbles), HEADER_PARITY);
-  if (!header || !header[0] || header[0] > MAX_BYTES) return -1;
-  return header[0];
+  if (!header) return null;
+  const [length, id] = header;
+  if (length === CONTROL.ack) return { type: 'ack', id };
+  if (length === CONTROL.nack) return { type: 'nack', id };
+  if (!length || length > MAX_BYTES) return null;
+  return { type: 'message', id, length };
 }
 
 // Returns the message text, or null if it could not be recovered.

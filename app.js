@@ -1,5 +1,5 @@
 import { MIN_SAMPLE_RATE } from './modem/config.js';
-import { MAX_BYTES, byteLength, encodeFrame } from './modem/codec.js';
+import { MAX_BYTES, byteLength, encodeControl, encodeFrame } from './modem/codec.js';
 import { modulate } from './modem/modulator.js';
 import { Demodulator } from './modem/demodulator.js';
 
@@ -16,10 +16,28 @@ const STORE_LIMIT = 200;
 const LOOPBACK = new URLSearchParams(location.search).has('loopback');
 const LOOPBACK_RATE = 48000;
 
+// Delivery receipts. The receiver answers after REPLY_DELAY so the sender has
+// finished playing and unmuted its microphone; the sender waits ACK_TIMEOUT
+// for that answer before trying again.
+const REPLY_DELAY = 600;
+const ACK_TIMEOUT = 3500;
+const ATTEMPTS = 3;
+const STATUS_LABELS = {
+  sending: 'Sending…',
+  waiting: 'Waiting for receipt…',
+  retrying: 'No receipt, sending again…',
+  delivered: 'Delivered ✓',
+  failed: 'Not delivered',
+  sent: 'Sent, no receipt (not listening)',
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 let ctx = null;
 let demod = null;
 let mic = null;
-let sending = false;
+let busy = false;         // a send, including its retries, is in progress
+let transmitting = false; // our own audio is playing; the microphone is ignored
 let receiving = false;
 let messages = [];
 
@@ -31,12 +49,17 @@ function loadMessages() {
   } catch {
     messages = [];
   }
+  // A send that was interrupted by closing the page never got its receipt.
+  for (const message of messages) {
+    if (['sending', 'waiting', 'retrying'].includes(message.status)) message.status = 'failed';
+  }
   messages.forEach(render);
 }
 
 function saveMessages() {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify(messages.slice(-STORE_LIMIT)));
+    const stored = messages.slice(-STORE_LIMIT).map(({ el, ...message }) => message);
+    localStorage.setItem(STORE_KEY, JSON.stringify(stored));
   } catch {
     // Storage is a convenience; the app works without it.
   }
@@ -47,22 +70,34 @@ function render(message) {
   const el = document.createElement('div');
   el.className = `msg ${message.dir}`;
   el.textContent = message.text;
+  const meta = document.createElement('small');
   const time = document.createElement('time');
   time.dateTime = new Date(message.at).toISOString();
   time.textContent = new Date(message.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  el.append(time);
+  const status = document.createElement('span');
+  meta.append(time, status);
+  el.append(meta);
   log.append(el);
   log.scrollTop = log.scrollHeight;
+  message.el = el;
+  setStatus(message, message.status);
   return el;
 }
 
-function addMessage(dir, body) {
-  const message = { dir, text: body, at: Date.now() };
+function addMessage(dir, body, status) {
+  const message = { dir, text: body, at: Date.now(), status };
   if (dir !== 'bad') {
     messages.push(message);
     saveMessages();
   }
-  return render(message);
+  render(message);
+  return message;
+}
+
+function setStatus(message, status) {
+  message.status = status;
+  message.el.dataset.status = status || '';
+  message.el.querySelector('span').textContent = status ? ` · ${STATUS_LABELS[status]}` : '';
 }
 
 // --- status ----------------------------------------------------------------
@@ -73,7 +108,7 @@ function showNotice(message) {
 }
 
 function updateStatus() {
-  const [state, label] = sending ? ['sending', 'Sending…']
+  const [state, label] = transmitting ? ['sending', 'Sending…']
     : receiving ? ['receiving', 'Receiving…']
     : mic || LOOPBACK ? ['listening', LOOPBACK ? 'Loopback test' : 'Listening']
     : ['idle', 'Not listening'];
@@ -97,6 +132,57 @@ function setLevel(db) {
   });
 }
 
+// --- receiving -------------------------------------------------------------
+
+let awaited = null;  // { id, resolve } while a sent message waits for its receipt
+let lastSeen = null; // last message shown, to recognise a retransmission
+let garbled = null;  // { id, message } notice to drop if a retry gets through
+
+function onFrame(frame) {
+  receiving = false;
+  updateStatus();
+  if (frame.type === 'ack' || frame.type === 'nack') {
+    if (awaited?.id === frame.id) awaited.resolve(frame.type);
+    return;
+  }
+  if (frame.type === 'garbled') {
+    if (garbled?.id !== frame.id) {
+      garbled = { id: frame.id, message: addMessage('bad', 'A message arrived but was too garbled to read. Asking the sender to repeat it…') };
+    }
+    reply('nack', frame.id);
+    return;
+  }
+  if (garbled?.id === frame.id) garbled.message.el.remove();
+  garbled = null;
+  // A repeat means our receipt was lost: acknowledge again, show it once.
+  const repeat = lastSeen && lastSeen.id === frame.id && lastSeen.text === frame.text &&
+    Date.now() - lastSeen.at < 60000;
+  lastSeen = { id: frame.id, text: frame.text, at: Date.now() };
+  if (!repeat) {
+    addMessage('in', frame.text);
+    // Not available on iOS, where no browser exposes vibration.
+    navigator.vibrate?.([120, 60, 120]);
+  }
+  reply('ack', frame.id);
+}
+
+async function reply(type, id) {
+  await sleep(REPLY_DELAY);
+  transmit(encodeControl(type, id)).catch(() => {});
+}
+
+function receiver(sampleRate) {
+  demod ??= new Demodulator(sampleRate, {
+    onLevel: setLevel,
+    onSync() {
+      receiving = true;
+      updateStatus();
+    },
+    onFrame,
+  });
+  return demod;
+}
+
 // --- audio -----------------------------------------------------------------
 
 async function audioContext() {
@@ -113,27 +199,6 @@ async function audioContext() {
     );
   }
   return ctx;
-}
-
-function receiver(sampleRate) {
-  demod ??= new Demodulator(sampleRate, {
-    onLevel: setLevel,
-    onSync() {
-      receiving = true;
-      updateStatus();
-    },
-    onFrame(body) {
-      receiving = false;
-      updateStatus();
-      if (body === null) addMessage('bad', 'A message arrived but was too garbled to read.');
-      else {
-        addMessage('in', body);
-        // Not available on iOS, where no browser exposes vibration.
-        navigator.vibrate?.([120, 60, 120]);
-      }
-    },
-  });
-  return demod;
 }
 
 async function startListening() {
@@ -164,8 +229,8 @@ async function startListening() {
   rx.reset();
   const source = audio.createMediaStreamSource(stream);
   const tap = new AudioWorkletNode(audio, 'rx-tap', { channelCount: 1, channelCountMode: 'explicit' });
-  // Half-duplex: ignore the microphone while our own message is playing.
-  tap.port.onmessage = (event) => { if (!sending) rx.push(event.data); };
+  // Half-duplex: ignore the microphone while our own audio is playing.
+  tap.port.onmessage = (event) => { if (!transmitting) rx.push(event.data); };
   // The graph only runs if it reaches the destination; keep that path silent.
   const silent = audio.createGain();
   silent.gain.value = 0;
@@ -198,27 +263,73 @@ function play(audio, samples) {
   });
 }
 
+// Play one frame. Transmissions are queued so a receipt never overlaps a
+// message of our own.
+let txQueue = Promise.resolve();
+function transmit(frame) {
+  const run = async () => {
+    if (LOOPBACK) {
+      await sleep(0);
+      receiver(LOOPBACK_RATE).push(modulate(frame, LOOPBACK_RATE));
+      return;
+    }
+    const audio = await audioContext();
+    transmitting = true;
+    updateStatus();
+    try {
+      await play(audio, modulate(frame, audio.sampleRate));
+      // Let the speaker drain and the room's echo die before listening again.
+      await sleep(200 + 1000 * (audio.outputLatency || 0));
+    } finally {
+      transmitting = false;
+      demod?.reset();
+      updateStatus();
+    }
+  };
+  txQueue = txQueue.then(run, run);
+  return txQueue;
+}
+
+function receipt(id) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve('timeout'), ACK_TIMEOUT);
+    awaited = { id, resolve: (result) => { clearTimeout(timer); resolve(result); } };
+  }).finally(() => { awaited = null; });
+}
+
+let nextId = Math.floor(Math.random() * 256);
+
 async function send(body) {
-  const frame = encodeFrame(body);
-  const bubble = addMessage('out', body);
-  bubble.classList.add('pending');
-  sending = true;
-  updateStatus();
+  const id = nextId;
+  nextId = (nextId + 1) % 256;
+  const frame = encodeFrame(body, id);
+  const message = addMessage('out', body, 'sending');
+  busy = true;
   updateComposer();
   try {
-    if (LOOPBACK) {
-      receiver(LOOPBACK_RATE).push(modulate(frame, LOOPBACK_RATE));
-    } else {
-      const audio = await audioContext();
-      await play(audio, modulate(frame, audio.sampleRate));
-      // Let the room's echo die down before listening again.
-      await new Promise((resolve) => setTimeout(resolve, 200));
+    let status = 'failed';
+    for (let attempt = 0; attempt < ATTEMPTS && status === 'failed'; attempt++) {
+      if (attempt) {
+        setStatus(message, 'retrying');
+        // Random back-off, so two devices that collided do not collide again.
+        await sleep(300 + Math.random() * 500);
+      }
+      await transmit(frame);
+      // Without a microphone we cannot hear a receipt.
+      if (!mic && !LOOPBACK) {
+        status = 'sent';
+        break;
+      }
+      if (!attempt) setStatus(message, 'waiting');
+      if (await receipt(id) === 'ack') status = 'delivered';
     }
+    setStatus(message, status);
+  } catch (error) {
+    setStatus(message, 'failed');
+    throw error;
   } finally {
-    sending = false;
-    if (!LOOPBACK) demod?.reset();
-    bubble.classList.remove('pending');
-    updateStatus();
+    busy = false;
+    saveMessages();
     updateComposer();
   }
 }
@@ -229,7 +340,7 @@ function updateComposer() {
   const bytes = byteLength(text.value.trim());
   $('count').textContent = `${bytes}/${MAX_BYTES}`;
   $('count').classList.toggle('over', bytes > MAX_BYTES);
-  sendButton.disabled = sending || !bytes || bytes > MAX_BYTES;
+  sendButton.disabled = busy || !bytes || bytes > MAX_BYTES;
   text.style.height = 'auto';
   text.style.height = `${text.scrollHeight + 3}px`;
 }

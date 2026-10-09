@@ -13,9 +13,12 @@ const LOST_SYMBOLS = 8;
 const LOST_RATIO = 0.3;
 
 // Streaming receiver: feed it microphone samples with push(); it reports
-//   onSync(length)        a frame header was read, `length` payload bytes follow
-//   onProgress(fraction)  while a frame body is arriving
-//   onFrame(text | null)  frame finished; null if it could not be recovered
+//   onSync(length)        a message header was read, `length` payload bytes follow
+//   onProgress(fraction)  while a message body is arriving
+//   onFrame(frame)        frame finished, one of
+//                           { type: 'message', id, text }
+//                           { type: 'garbled', id }   body could not be recovered
+//                           { type: 'ack' | 'nack', id }
 //   onLevel(dbfs)         strongest in-band tone, for a signal meter
 export class Demodulator {
   constructor(sampleRate, handlers = {}) {
@@ -172,7 +175,7 @@ export class Demodulator {
     this.dataStart = start;
     this.nibbles = [];
     this.expected = HEADER_NIBBLES;
-    this.length = 0;
+    this.header = null;
     this.lost = 0;
   }
 
@@ -191,24 +194,27 @@ export class Demodulator {
     this.nibbles.push(best);
     this.lost = sum && e[2 * best + parity] / sum >= LOST_RATIO ? 0 : this.lost + 1;
 
-    if (this.lost >= LOST_SYMBOLS) return this._finish(this.length ? null : undefined);
+    const { header } = this;
+    const garbled = header && { type: 'garbled', id: header.id };
+    if (this.lost >= LOST_SYMBOLS) return this._finish(garbled);
     if (this.nibbles.length < this.expected) {
-      if (this.length) this.handlers.onProgress?.(this.nibbles.length / this.expected);
+      if (header) this.handlers.onProgress?.(this.nibbles.length / this.expected);
       return;
     }
-    if (!this.length) {
-      this.length = decodeHeader(this.nibbles);
+    if (!header) {
+      this.header = decodeHeader(this.nibbles);
       // An unreadable header is most likely a false alarm; stay quiet.
-      if (this.length < 0) return this._finish(undefined);
-      this.expected += bodyNibbles(this.length);
-      this.handlers.onSync?.(this.length);
+      if (this.header?.type !== 'message') return this._finish(this.header);
+      this.expected += bodyNibbles(this.header.length);
+      this.handlers.onSync?.(this.header.length);
       return;
     }
-    this._finish(decodeBody(this.nibbles.slice(HEADER_NIBBLES), this.length));
+    const text = decodeBody(this.nibbles.slice(HEADER_NIBBLES), header.length);
+    this._finish(text === null ? garbled : { type: 'message', id: header.id, text });
   }
 
   _finish(result) {
     this.reset();
-    if (result !== undefined) this.handlers.onFrame?.(result);
+    if (result) this.handlers.onFrame?.(result);
   }
 }
