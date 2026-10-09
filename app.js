@@ -29,6 +29,7 @@ const STATUS_LABELS = {
   delivered: 'Delivered ✓',
   failed: 'Not delivered',
   sent: 'Sent, no receipt (microphone off)',
+  broadcast: 'Broadcast',
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -145,6 +146,10 @@ function onFrame(frame) {
     if (awaited?.id === frame.id) awaited.resolve(frame.type);
     return;
   }
+  if (frame.type === 'garbled' && frame.broadcast) {
+    addMessage('bad', 'A broadcast arrived but was too garbled to read.');
+    return;
+  }
   if (frame.type === 'garbled') {
     if (garbled?.id !== frame.id) {
       garbled = { id: frame.id, message: addMessage('bad', 'A message arrived but was too garbled to read. Asking the sender to repeat it…') };
@@ -159,11 +164,12 @@ function onFrame(frame) {
     Date.now() - lastSeen.at < 60000;
   lastSeen = { id: frame.id, text: frame.text, at: Date.now() };
   if (!repeat) {
-    addMessage('in', frame.text);
+    addMessage('in', frame.text, frame.broadcast ? 'broadcast' : undefined);
     // Not available on iOS, where no browser exposes vibration.
     navigator.vibrate?.([120, 60, 120]);
   }
-  reply('ack', frame.id);
+  // Broadcasts go to many devices at once; their replies would collide.
+  if (!frame.broadcast) reply('ack', frame.id);
 }
 
 async function reply(type, id) {
@@ -299,16 +305,16 @@ function receipt(id) {
 
 let nextId = Math.floor(Math.random() * 256);
 
-async function send(body) {
+async function send(body, broadcast) {
   const id = nextId;
   nextId = (nextId + 1) % 256;
-  const frame = encodeFrame(body, id);
+  const frame = encodeFrame(body, id, broadcast);
   const message = addMessage('out', body, 'sending');
   busy = true;
   updateComposer();
   // Receipts can only be heard with the microphone on. Turn it on here, before
   // any await, so the permission prompt is tied to the tap on Send.
-  const listening = mic || LOOPBACK ? null : startListening();
+  const listening = mic || LOOPBACK || broadcast ? null : startListening();
   try {
     try {
       await listening;
@@ -324,6 +330,10 @@ async function send(body) {
         await sleep(300 + Math.random() * 500);
       }
       await transmit(frame);
+      if (broadcast) {
+        status = 'broadcast';
+        break;
+      }
       if (!mic && !LOOPBACK) {
         status = 'sent';
         break;
@@ -375,7 +385,7 @@ $('composer').addEventListener('submit', async (event) => {
   text.value = '';
   showNotice('');
   try {
-    await send(body);
+    await send(body, $('broadcast').checked);
   } catch (error) {
     showNotice(describe(error));
   }

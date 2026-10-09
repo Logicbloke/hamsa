@@ -1,5 +1,5 @@
 // Bump on every release so clients pick up the new files.
-const CACHE = 'hamsa-v4';
+const CACHE = 'hamsa-v5';
 
 const ASSETS = [
   './',

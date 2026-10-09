@@ -184,7 +184,7 @@ test('reports sync and progress before the frame', () => {
   });
   demod.push(channel(modulate(encodeFrame('hi', 7), sr), sr, {}));
   assert.deepEqual(events, [
-    ['sync', 2], ['progress', true], ['frame', { type: 'message', id: 7, text: 'hi' }],
+    ['sync', 2], ['progress', true], ['frame', { type: 'message', id: 7, broadcast: false, text: 'hi' }],
   ]);
 });
 
@@ -192,10 +192,10 @@ test('header survives two bad bytes and rejects garbage', () => {
   const header = encodeFrame('hello', 42).slice(0, HEADER_NIBBLES);
   header[0] ^= 7;
   header[5] ^= 1;
-  assert.deepEqual(decodeHeader(header), { type: 'message', id: 42, length: 5 });
+  assert.deepEqual(decodeHeader(header), { type: 'message', id: 42, length: 5, broadcast: false });
   header[8] ^= 3;
   header[10] ^= 3;
-  assert.notDeepEqual(decodeHeader(header), { type: 'message', id: 42, length: 5 });
+  assert.notDeepEqual(decodeHeader(header), { type: 'message', id: 42, length: 5, broadcast: false });
 });
 
 test('ack and nack frames carry the message id through noise and echo', () => {
@@ -220,4 +220,25 @@ test('a message followed by its ack', () => {
   audio.set(a);
   audio.set(b, a.length);
   assert.deepEqual(receive(audio, sr), ['ping', 'ack']);
+});
+
+test('broadcast flag survives the air, at any length', () => {
+  const sr = 48000;
+  for (const text of ['b', 'to everyone', 'y'.repeat(MAX_BYTES)]) {
+    const frames = [];
+    const demod = new Demodulator(sr, { onFrame: (f) => frames.push(f) });
+    demod.push(channel(modulate(encodeFrame(text, 3, true), sr), sr, { gain: 0.05, noise: 0.01 }));
+    assert.deepEqual(frames, [{ type: 'message', id: 3, broadcast: true, text }]);
+  }
+});
+
+test('a cut-off broadcast is reported as a garbled broadcast', () => {
+  const sr = 48000;
+  const signal = modulate(encodeFrame('this broadcast gets cut off halfway through', 4, true), sr);
+  const audio = channel(signal.subarray(0, signal.length >> 1), sr, {});
+  const frames = [];
+  const demod = new Demodulator(sr, { onFrame: (f) => frames.push(f) });
+  demod.push(audio);
+  demod.push(new Float32Array(sr * 2).map((_, i) => 0.001 * Math.sin(i)));
+  assert.deepEqual(frames, [{ type: 'garbled', id: 4, broadcast: true }]);
 });

@@ -16,8 +16,8 @@ const LOST_RATIO = 0.3;
 //   onSync(length)        a message header was read, `length` payload bytes follow
 //   onProgress(fraction)  while a message body is arriving
 //   onFrame(frame)        frame finished, one of
-//                           { type: 'message', id, text }
-//                           { type: 'garbled', id }   body could not be recovered
+//                           { type: 'message', id, broadcast, text }
+//                           { type: 'garbled', id, broadcast }   body unrecoverable
 //                           { type: 'ack' | 'nack', id }
 //   onLevel(dbfs)         strongest in-band tone, for a signal meter
 export class Demodulator {
@@ -195,7 +195,7 @@ export class Demodulator {
     this.lost = sum && e[2 * best + parity] / sum >= LOST_RATIO ? 0 : this.lost + 1;
 
     const { header } = this;
-    const garbled = header && { type: 'garbled', id: header.id };
+    const garbled = header && { type: 'garbled', id: header.id, broadcast: header.broadcast };
     if (this.lost >= LOST_SYMBOLS) return this._finish(garbled);
     if (this.nibbles.length < this.expected) {
       if (header) this.handlers.onProgress?.(this.nibbles.length / this.expected);
@@ -210,7 +210,7 @@ export class Demodulator {
       return;
     }
     const text = decodeBody(this.nibbles.slice(HEADER_NIBBLES), header.length);
-    this._finish(text === null ? garbled : { type: 'message', id: header.id, text });
+    this._finish(text === null ? garbled : { ...garbled, type: 'message', text });
   }
 
   _finish(result) {

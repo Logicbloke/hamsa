@@ -27,6 +27,10 @@ to twice when no acknowledgement comes back, and otherwise marks the message
 **Not delivered**. If the microphone is unavailable the message is still sent
 and shows **Sent, no receipt**.
 
+Tick **Broadcast (no receipt)** to send to several devices at once. Receivers
+show the message but stay silent, since their replies would collide, so the
+sender gets no confirmation and does not resend.
+
 Receiving phones vibrate on a new message where the browser supports it
 (Android; iOS browsers do not expose vibration).
 
@@ -46,7 +50,7 @@ Receiving phones vibrate on a new message where the browser supports it
 | Band | 32 tones, 18.000-20.325 kHz, 75 Hz apart |
 | Modulation | 16-FSK, 40 ms symbols (4 bits each), raised-cosine edges |
 | Echo rejection | even and odd symbols use two interleaved 16-tone sets |
-| Framing | 8-symbol preamble, header (length, message id), UTF-8 payload, CRC-16 |
+| Framing | 8-symbol preamble, header (length, broadcast flag, message id), UTF-8 payload, CRC-16 |
 | Receipts | header-only ACK / NACK frames carrying the message id |
 | Error correction | Reed-Solomon over GF(256), about one bad byte in eight |
 | Receiver | Goertzel filter bank, preamble search at quarter-symbol hops |

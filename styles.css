@@ -212,7 +212,22 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 }
 .count.over { color: var(--warn); font-weight: 600; }
 
-.foot { padding: 2px 16px 10px; text-align: center; }
+.foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 4px 16px 10px;
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--muted);
+  cursor: pointer;
+}
+.check input { accent-color: var(--accent); width: 16px; height: 16px; margin: 0; }
 .link {
   border: 0;
   background: none;
