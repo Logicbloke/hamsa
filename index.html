@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Hamsa</title>
+  <meta name="description" content="Send and receive text messages over ultrasound. Works offline, no network needed.">
+  <meta name="theme-color" content="#f6f5fb" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#12111c" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="brand">
+      <img src="icons/icon.svg" alt="" width="36" height="36">
+      <div>
+        <h1>Hamsa</h1>
+        <p>Messages over ultrasound</p>
+      </div>
+    </div>
+    <button id="listen" class="toggle" type="button" aria-pressed="false">Start listening</button>
+  </header>
+
+  <section class="status" aria-label="Receiver status">
+    <span id="status" class="pill" data-state="idle">Not listening</span>
+    <div class="meter" role="meter" aria-label="Ultrasound signal level" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="meter">
+      <div id="meter-fill"></div>
+    </div>
+  </section>
+
+  <main id="log" aria-live="polite">
+    <div id="empty" class="empty">
+      <h2>Whisper to a nearby device</h2>
+      <ol>
+        <li>Open Hamsa on two devices and put them close together.</li>
+        <li>Tap <b>Start listening</b> on the one that should receive and allow the microphone.</li>
+        <li>Turn the volume up on the sender, type a message and send.</li>
+      </ol>
+      <p>Nothing leaves your device except sound. No internet is used.</p>
+    </div>
+  </main>
+
+  <p id="notice" class="notice" role="alert" hidden></p>
+
+  <form id="composer" class="composer" autocomplete="off">
+    <label class="sr-only" for="text">Message</label>
+    <textarea id="text" rows="1" placeholder="Type a message" enterkeyhint="send"></textarea>
+    <span id="count" class="count" aria-live="off">0/120</span>
+    <button id="send" type="submit" disabled>Send</button>
+  </form>
+
+  <footer class="foot">
+    <button id="clear" type="button" class="link">Clear messages</button>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
