@@ -28,7 +28,7 @@ const STATUS_LABELS = {
   retrying: 'No receipt, sending again…',
   delivered: 'Delivered ✓',
   failed: 'Not delivered',
-  sent: 'Sent, no receipt (not listening)',
+  sent: 'Sent, no receipt (microphone off)',
 };
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -306,7 +306,16 @@ async function send(body) {
   const message = addMessage('out', body, 'sending');
   busy = true;
   updateComposer();
+  // Receipts can only be heard with the microphone on. Turn it on here, before
+  // any await, so the permission prompt is tied to the tap on Send.
+  const listening = mic || LOOPBACK ? null : startListening();
   try {
+    try {
+      await listening;
+    } catch (error) {
+      showNotice(`Sending without a delivery receipt. ${describe(error)}`);
+    }
+    updateStatus();
     let status = 'failed';
     for (let attempt = 0; attempt < ATTEMPTS && status === 'failed'; attempt++) {
       if (attempt) {
@@ -315,7 +324,6 @@ async function send(body) {
         await sleep(300 + Math.random() * 500);
       }
       await transmit(frame);
-      // Without a microphone we cannot hear a receipt.
       if (!mic && !LOOPBACK) {
         status = 'sent';
         break;

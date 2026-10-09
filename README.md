@@ -21,10 +21,11 @@ talk at a time; a device ignores its microphone while it is sending.
 ### Delivery receipts
 
 The receiver answers every message with a short acknowledgement, or with a
-request to repeat it if it arrived garbled. If the sender is listening too, it
-shows **Delivered ✓**, resends up to twice when no acknowledgement comes back,
-and otherwise marks the message **Not delivered**. A sender that is not
-listening cannot hear receipts and shows **Sent, no receipt**.
+request to repeat it if it arrived garbled. Sending turns the sender's
+microphone on so it can hear that answer: it shows **Delivered ✓**, resends up
+to twice when no acknowledgement comes back, and otherwise marks the message
+**Not delivered**. If the microphone is unavailable the message is still sent
+and shows **Sent, no receipt**.
 
 Receiving phones vibrate on a new message where the browser supports it
 (Android; iOS browsers do not expose vibration).
