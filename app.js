@@ -126,21 +126,39 @@ function receiver(sampleRate) {
       receiving = false;
       updateStatus();
       if (body === null) addMessage('bad', 'A message arrived but was too garbled to read.');
-      else addMessage('in', body);
+      else {
+        addMessage('in', body);
+        // Not available on iOS, where no browser exposes vibration.
+        navigator.vibrate?.([120, 60, 120]);
+      }
     },
   });
   return demod;
 }
 
 async function startListening() {
-  if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
-    throw new Error('This browser cannot capture microphone audio for decoding.');
+  if (!window.isSecureContext) {
+    throw new Error('The microphone only works on https:// pages.');
   }
-  const audio = await audioContext();
+  if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) {
+    throw new Error('This browser cannot capture microphone audio. Update it, or on iOS try Safari.');
+  }
+  // Ask for the microphone and start the audio context in the same tap, before
+  // any await: iOS browsers only honour both while the tap is still "active".
   // Voice processing filters out exactly the frequencies we need.
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+  const pending = navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
   });
+  let audio;
+  let stream;
+  try {
+    [audio, stream] = await Promise.all([audioContext(), pending]);
+  } catch (error) {
+    pending.then((s) => s.getTracks().forEach((track) => track.stop()), () => {});
+    throw error;
+  }
+  // Opening the microphone can suspend the context on iOS.
+  if (audio.state !== 'running') await audio.resume();
   await audio.audioWorklet.addModule('modem/rx-worklet.js');
   const rx = receiver(audio.sampleRate);
   rx.reset();
@@ -216,10 +234,19 @@ function updateComposer() {
   text.style.height = `${text.scrollHeight + 3}px`;
 }
 
+const IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
 function describe(error) {
-  if (error.name === 'NotAllowedError') return 'Microphone access was blocked. Allow it in the browser’s site settings to receive messages.';
+  if (error.name === 'NotAllowedError' || error.name === 'SecurityError') {
+    return IOS
+      ? 'Microphone access was blocked. In the iOS Settings app, open the entry for this browser ' +
+        '(for example Settings > Apps > Chrome), turn Microphone on, then reload this page.'
+      : 'Microphone access was blocked. Allow it in the browser’s site settings, then try again.';
+  }
   if (error.name === 'NotFoundError') return 'No microphone was found on this device.';
-  return error.message || String(error);
+  if (error.name === 'NotReadableError') return 'The microphone is in use by another app. Close it and try again.';
+  return `${error.message || error} (${error.name || 'error'})`;
 }
 
 $('composer').addEventListener('submit', async (event) => {
