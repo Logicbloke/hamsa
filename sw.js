@@ -1,5 +1,5 @@
 // Bump on every release so clients pick up the new files.
-const CACHE = 'hamsa-v5';
+const CACHE = 'hamsa-v6';
 
 const ASSETS = [
   './',
@@ -12,6 +12,7 @@ const ASSETS = [
   'modem/reedsolomon.js',
   'modem/modulator.js',
   'modem/demodulator.js',
+  'modem/ranging.js',
   'modem/rx-worklet.js',
   'icons/icon.svg',
   'icons/icon-192.png',

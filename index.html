@@ -31,11 +31,13 @@
     </div>
   </section>
 
+  <p id="roster" class="roster" hidden></p>
+
   <main id="log" aria-live="polite">
     <div id="empty" class="empty">
       <h2>Whisper to a nearby device</h2>
       <ol>
-        <li>Open Hamsa on two devices and put them close together.</li>
+        <li>Open Hamsa on two devices, put them close together and enter a name on each.</li>
         <li>Tap <b>Start listening</b> on the one that should receive and allow the microphone.</li>
         <li>Turn the volume up on the sender, type a message and send.</li>
       </ol>
@@ -44,6 +46,12 @@
   </main>
 
   <p id="notice" class="notice" role="alert" hidden></p>
+
+  <form id="namer" class="composer" autocomplete="off" hidden>
+    <label class="sr-only" for="name">Your name</label>
+    <input id="name" type="text" maxlength="16" placeholder="Your name, sent with each message" enterkeyhint="done" required>
+    <button type="submit">Save</button>
+  </form>
 
   <form id="composer" class="composer" autocomplete="off">
     <label class="sr-only" for="text">Message</label>
@@ -56,6 +64,7 @@
     <label class="check" title="Send to every device in range. Receivers do not reply, so there is no delivery receipt.">
       <input id="broadcast" type="checkbox"> Broadcast (no receipt)
     </label>
+    <button id="rename" type="button" class="link" title="Change your name" hidden></button>
     <button id="clear" type="button" class="link">Clear messages</button>
   </footer>
 

@@ -2,7 +2,8 @@ import {
   HOPS_PER_SYMBOL, PREAMBLE, SET_SIZE, TONE_COUNT,
   symbolLength, toneFreq, toneIndex,
 } from './config.js';
-import { HEADER_NIBBLES, bodyNibbles, decodeBody, decodeHeader } from './codec.js';
+import { HEADER_NIBBLES, bodyNibbles, decodeBody, decodeHeader, decodeName } from './codec.js';
+import { preambleTemplate } from './modulator.js';
 
 const P = PREAMBLE.length;
 const HISTORY = (P - 1) * HOPS_PER_SYMBOL + 1;
@@ -13,16 +14,23 @@ const LOST_SYMBOLS = 8;
 const LOST_RATIO = 0.3;
 
 // Streaming receiver: feed it microphone samples with push(); it reports
-//   onSync(length)        a message header was read, `length` payload bytes follow
-//   onProgress(fraction)  while a message body is arriving
-//   onFrame(frame)        frame finished, one of
-//                           { type: 'message', id, broadcast, text }
-//                           { type: 'garbled', id, broadcast }   body unrecoverable
-//                           { type: 'ack' | 'nack', id }
-//   onLevel(dbfs)         strongest in-band tone, for a signal meter
+//   onSync(length, header)  a header was read, `length` payload bytes follow
+//   onProgress(fraction)    while a body is arriving
+//   onFrame(frame)          frame finished, one of
+//                             { type: 'message', id, from, broadcast, name, text }
+//                             { type: 'garbled', id, from, broadcast }  body unrecoverable
+//                             { type: 'ack' | 'nack', id, from }
+//                             { type: 'hello' | 'here', from, name }
+//                             { type: 'range', micros }
+//                           each with `at`, the moment its preamble began to
+//                           arrive, in seconds of audio pushed so far (or
+//                           undefined if that could not be measured)
+//   onLevel(dbfs)           strongest in-band tone, for a signal meter
 export class Demodulator {
   constructor(sampleRate, handlers = {}) {
     this.handlers = handlers;
+    this.sampleRate = sampleRate;
+    this.template = preambleTemplate(sampleRate);
     this.symLen = symbolLength(sampleRate);
     this.hop = Math.floor(this.symLen / HOPS_PER_SYMBOL);
 
@@ -177,10 +185,59 @@ export class Demodulator {
     this.expected = HEADER_NIBBLES;
     this.header = null;
     this.lost = 0;
+    this.at = undefined;
+  }
+
+  // Magnitude of the correlation between the known preamble and the audio
+  // starting at buffer offset `start`. Phase is unknown, so both quadratures.
+  _correlate(start) {
+    const { buf } = this;
+    const { sin, cos } = this.template;
+    let i = 0;
+    let q = 0;
+    for (let n = 0; n < sin.length; n++) {
+      const s = buf[start + n];
+      i += s * sin[n];
+      q += s * cos[n];
+    }
+    return Math.hypot(i, q);
+  }
+
+  // Time the preamble's arrival to a fraction of a sample: slide the known
+  // preamble waveform across the audio and take the correlation peak. Echoes
+  // drag the estimate from _lock late, so look further back than forward.
+  _arrival() {
+    const origin = this.dataStart - P * this.symLen - this.base;
+    const from = Math.max(1, origin - (this.symLen >> 1));
+    const to = Math.min(origin + (this.hop >> 1), this.len - this.template.sin.length - 1);
+    if (to <= from) return undefined;
+    // The peak is about 1 / bandwidth wide; a coarse pass cannot step over it.
+    const step = Math.max(1, Math.round(this.sampleRate / 12000));
+    let peak = from;
+    let best = -1;
+    const consider = (start) => {
+      const power = this._correlate(start);
+      if (power > best) {
+        best = power;
+        peak = start;
+      }
+    };
+    for (let start = from; start <= to; start += step) consider(start);
+    const coarse = peak;
+    for (let start = Math.max(from, coarse - step + 1); start <= Math.min(to, coarse + step - 1); start++) {
+      if (start !== coarse) consider(start);
+    }
+    // Parabola through the peak and its neighbours.
+    const before = this._correlate(peak - 1);
+    const after = this._correlate(peak + 1);
+    const curve = before - 2 * best + after;
+    const fraction = curve < 0 ? (0.5 * (before - after)) / curve : 0;
+    return (this.base + peak + Math.max(-0.5, Math.min(0.5, fraction))) / this.sampleRate;
   }
 
   _dataStep() {
     const n = this.nibbles.length;
+    if (!n) this.at = this._arrival();
     const e = this._energies(this.dataStart + n * this.symLen, this.energy);
     this._reportLevel(e);
     const parity = (P + n) & 1;
@@ -195,7 +252,10 @@ export class Demodulator {
     this.lost = sum && e[2 * best + parity] / sum >= LOST_RATIO ? 0 : this.lost + 1;
 
     const { header } = this;
-    const garbled = header && { type: 'garbled', id: header.id, broadcast: header.broadcast };
+    // What to report if the body cannot be read. A hello still tells us who.
+    const garbled = header && (header.type === 'message'
+      ? { type: 'garbled', id: header.id, from: header.from, broadcast: header.broadcast }
+      : { type: header.type, from: header.from, name: '' });
     if (this.lost >= LOST_SYMBOLS) return this._finish(garbled);
     if (this.nibbles.length < this.expected) {
       if (header) this.handlers.onProgress?.(this.nibbles.length / this.expected);
@@ -204,17 +264,26 @@ export class Demodulator {
     if (!header) {
       this.header = decodeHeader(this.nibbles);
       // An unreadable header is most likely a false alarm; stay quiet.
-      if (this.header?.type !== 'message') return this._finish(this.header);
+      if (!this.header?.length) {
+        // A hello with no name has no body either.
+        const { type, from } = this.header || {};
+        return this._finish(this.header?.length === 0 ? { type, from, name: '' } : this.header);
+      }
       this.expected += bodyNibbles(this.header.length);
-      this.handlers.onSync?.(this.header.length);
+      this.handlers.onSync?.(this.header.length, this.header);
       return;
     }
-    const text = decodeBody(this.nibbles.slice(HEADER_NIBBLES), header.length);
-    this._finish(text === null ? garbled : { ...garbled, type: 'message', text });
+    const body = this.nibbles.slice(HEADER_NIBBLES);
+    if (header.type === 'message') {
+      const decoded = decodeBody(body, header.length);
+      return this._finish(decoded ? { ...garbled, type: 'message', ...decoded } : garbled);
+    }
+    this._finish({ ...garbled, name: decodeName(body, header.length) ?? '' });
   }
 
   _finish(result) {
+    const { at } = this;
     this.reset();
-    if (result) this.handlers.onFrame?.(result);
+    if (result) this.handlers.onFrame?.({ ...result, at });
   }
 }

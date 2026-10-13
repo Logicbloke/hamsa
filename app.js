@@ -1,7 +1,10 @@
 import { MIN_SAMPLE_RATE } from './modem/config.js';
-import { MAX_BYTES, byteLength, encodeControl, encodeFrame } from './modem/codec.js';
+import {
+  MAX_BYTES, NAME_MAX_BYTES, byteLength, encodeAnnounce, encodeControl, encodeFrame, encodeRange,
+} from './modem/codec.js';
 import { modulate } from './modem/modulator.js';
 import { Demodulator } from './modem/demodulator.js';
+import { distance, formatDistance, turnaroundMicros } from './modem/ranging.js';
 
 const $ = (id) => document.getElementById(id);
 const log = $('log');
@@ -10,6 +13,8 @@ const sendButton = $('send');
 const listenButton = $('listen');
 
 const STORE_KEY = 'hamsa.messages';
+const NAME_KEY = 'hamsa.name';
+const DEVICE_KEY = 'hamsa.device';
 const STORE_LIMIT = 200;
 // ?loopback feeds sent audio straight into the receiver: a self-test that
 // needs neither speaker nor microphone.
@@ -22,6 +27,22 @@ const LOOPBACK_RATE = 48000;
 const REPLY_DELAY = 600;
 const ACK_TIMEOUT = 3500;
 const ATTEMPTS = 3;
+// After its receipt the receiver sends one more frame, the timing needed to
+// work out the distance. Stay off the air until it has arrived.
+const RANGE_TIMEOUT = 2500;
+// A frame carrying our own id is our own sound if it ends this soon after we
+// stopped playing; later than that, another device has picked the same id.
+const ECHO_WINDOW = 1000;
+// A device not heard from for this long is assumed to have left.
+const PEER_TTL = 5 * 60 * 1000;
+const JOIN_LINES = [
+  '{name} is listening',
+  '{name} is on the frequency',
+  '{name} tuned in',
+  '{name} joined the whisper',
+  '{name} is within earshot',
+  '{name} just dropped in',
+];
 const STATUS_LABELS = {
   sending: 'Sending…',
   waiting: 'Waiting for receipt…',
@@ -41,12 +62,101 @@ let busy = false;         // a send, including its retries, is in progress
 let transmitting = false; // our own audio is playing; the microphone is ignored
 let receiving = false;
 let messages = [];
+let lastTransmit = 0;     // when our own audio last stopped
 
+function stored(storage, key) {
+  try {
+    return storage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function store(storage, key, value) {
+  try {
+    storage.setItem(key, value);
+  } catch {
+    // Storage is a convenience; the app works without it.
+  }
+}
+
+// --- identity --------------------------------------------------------------
+
+// Trim a name to what fits in a frame without splitting a character.
+function clipName(value) {
+  const chars = Array.from((value || '').replace(/[\u0000-\u001f]/g, ' ').trim());
+  while (byteLength(chars.join('')) > NAME_MAX_BYTES) chars.pop();
+  return chars.join('').trim();
+}
+
+let name = clipName(stored(localStorage, NAME_KEY));
+// Random id that tells devices apart on the air, including our own echo.
+let deviceId = Number(stored(sessionStorage, DEVICE_KEY) ?? NaN);
+if (!(deviceId >= 0 && deviceId < 256)) newDeviceId();
+
+function newDeviceId() {
+  deviceId = Math.floor(Math.random() * 256);
+  store(sessionStorage, DEVICE_KEY, String(deviceId));
+}
+
+function showNamer(show) {
+  $('namer').hidden = !show;
+  $('composer').hidden = show;
+  $('rename').hidden = show || !name;
+  $('rename').textContent = `You: ${name}`;
+  if (show) $('name').focus();
+}
+
+// --- nearby devices --------------------------------------------------------
+
+const peers = new Map();   // device id -> { name, at } for devices heard lately
+const greeted = new Map(); // device id -> when its arrival was last announced
+
+// With two or more other devices around, receipts would collide: everything
+// is sent as a broadcast.
+function groupMode() {
+  return peers.size >= 2;
+}
+
+function updateRoster() {
+  for (const [id, peer] of peers) if (Date.now() - peer.at > PEER_TTL) peers.delete(id);
+  const names = [...peers.values()].map((peer) => peer.name || 'Someone');
+  $('roster').hidden = !names.length;
+  $('roster').textContent = `Nearby: ${names.join(', ')}${groupMode() ? ' · group mode, no receipts' : ''}`;
+}
+
+// Note that a device was heard. Returns true if it was not known before.
+function heard(frame) {
+  const known = peers.get(frame.from);
+  peers.set(frame.from, { name: frame.name || known?.name || '', at: Date.now() });
+  updateRoster();
+  // A send still waiting for its receipt will not get a clean one now.
+  if (groupMode()) awaited?.resolve({ type: 'group' });
+  return !known;
+}
+
+// Say hello, or answer one, after a random delay and only on a quiet channel,
+// so several devices answering the same hello rarely talk over each other.
+let announcing = null;
+function announce(type, min, max) {
+  if (announcing) return;
+  const attempt = () => {
+    if (!mic && !LOOPBACK) {
+      announcing = null;
+    } else if (busy || transmitting || replying || demod?.receiving) {
+      announcing = setTimeout(attempt, 400 + Math.random() * 800);
+    } else {
+      announcing = null;
+      transmit(encodeAnnounce(type, deviceId, name)).catch(() => {});
+    }
+  };
+  announcing = setTimeout(attempt, min + Math.random() * (max - min));
+}
 // --- message log -----------------------------------------------------------
 
 function loadMessages() {
   try {
-    messages = JSON.parse(localStorage.getItem(STORE_KEY)) || [];
+    messages = JSON.parse(stored(localStorage, STORE_KEY)) || [];
   } catch {
     messages = [];
   }
@@ -58,12 +168,8 @@ function loadMessages() {
 }
 
 function saveMessages() {
-  try {
-    const stored = messages.slice(-STORE_LIMIT).map(({ el, ...message }) => message);
-    localStorage.setItem(STORE_KEY, JSON.stringify(stored));
-  } catch {
-    // Storage is a convenience; the app works without it.
-  }
+  const kept = messages.slice(-STORE_LIMIT).map(({ el, ...message }) => message);
+  store(localStorage, STORE_KEY, JSON.stringify(kept));
 }
 
 function render(message) {
@@ -71,6 +177,11 @@ function render(message) {
   const el = document.createElement('div');
   el.className = `msg ${message.dir}`;
   el.textContent = message.text;
+  if (message.name) {
+    const who = document.createElement('b');
+    who.textContent = message.name;
+    el.prepend(who);
+  }
   const meta = document.createElement('small');
   const time = document.createElement('time');
   time.dateTime = new Date(message.at).toISOString();
@@ -85,8 +196,9 @@ function render(message) {
   return el;
 }
 
-function addMessage(dir, body, status) {
+function addMessage(dir, body, status, from) {
   const message = { dir, text: body, at: Date.now(), status };
+  if (from) message.name = from;
   if (dir !== 'bad') {
     messages.push(message);
     saveMessages();
@@ -98,7 +210,21 @@ function addMessage(dir, body, status) {
 function setStatus(message, status) {
   message.status = status;
   message.el.dataset.status = status || '';
-  message.el.querySelector('span').textContent = status ? ` · ${STATUS_LABELS[status]}` : '';
+  let label = status ? ` · ${STATUS_LABELS[status]}` : '';
+  if (status === 'delivered' && message.distance != null) {
+    label += ` · ${formatDistance(message.distance)} away`;
+  }
+  message.el.querySelector('span').textContent = label;
+}
+
+// A line in the log that is not a message, such as someone arriving.
+function addNote(body) {
+  $('empty').hidden = true;
+  const el = document.createElement('div');
+  el.className = 'note';
+  el.textContent = body;
+  log.append(el);
+  log.scrollTop = log.scrollHeight;
 }
 
 // --- status ----------------------------------------------------------------
@@ -135,18 +261,53 @@ function setLevel(db) {
 
 // --- receiving -------------------------------------------------------------
 
-let awaited = null;  // { id, resolve } while a sent message waits for its receipt
-let lastSeen = null; // last message shown, to recognise a retransmission
-let garbled = null;  // { id, message } notice to drop if a retry gets through
+let awaited = null;      // { id, resolve } while a sent message waits for its receipt
+let awaitedRange = null; // resolve, while a delivered message waits for its timing frame
+let lastSeen = null;     // last message shown, to recognise a retransmission
+let garbled = null;      // { id, message } notice to drop if a retry gets through
+let selfHeard = null;    // our own latest frame as the microphone heard it
+let ranging = null;      // { id, at } of the message whose receipt we are sending
+let replying = 0;        // receipts waiting to go out
 
 function onFrame(frame) {
   receiving = false;
   updateStatus();
-  if (frame.type === 'ack' || frame.type === 'nack') {
-    if (awaited?.id === frame.id) awaited.resolve(frame.type);
+  const echo = !LOOPBACK && (transmitting || Date.now() - lastTransmit < ECHO_WINDOW);
+  if (frame.type === 'range') {
+    if (!echo) awaitedRange?.(frame);
     return;
   }
-  if (frame.type === 'garbled' && frame.broadcast) {
+  if (!LOOPBACK && frame.from === deviceId) {
+    if (echo) {
+      heardSelf(frame);
+      return;
+    }
+    newDeviceId();
+  }
+  const fresh = heard(frame);
+  const who = frame.name || peers.get(frame.from).name || 'Someone';
+  if (frame.type === 'hello') {
+    if (Date.now() - (greeted.get(frame.from) || 0) > 60000) {
+      greeted.set(frame.from, Date.now());
+      addNote(JOIN_LINES[Math.floor(Math.random() * JOIN_LINES.length)].replace('{name}', who));
+    }
+    announce('here', 500, 4500);
+    return;
+  }
+  if (frame.type === 'here') {
+    if (fresh) addNote(`Also here: ${who}`);
+    return;
+  }
+  if (frame.type === 'ack' || frame.type === 'nack') {
+    if (awaited?.id === frame.id) awaited.resolve(frame);
+    return;
+  }
+  // Broadcasts go to many devices at once; their replies would collide. The
+  // same holds for a sender that has not noticed the group yet: tell it we
+  // are here, once its exchange with any other receiver is over.
+  const silent = frame.broadcast || groupMode();
+  if (silent && !frame.broadcast) announce('here', 3500, 6000);
+  if (frame.type === 'garbled' && silent) {
     addMessage('bad', 'A broadcast arrived but was too garbled to read.');
     return;
   }
@@ -160,27 +321,48 @@ function onFrame(frame) {
   if (garbled?.id === frame.id) garbled.message.el.remove();
   garbled = null;
   // A repeat means our receipt was lost: acknowledge again, show it once.
-  const repeat = lastSeen && lastSeen.id === frame.id && lastSeen.text === frame.text &&
-    Date.now() - lastSeen.at < 60000;
-  lastSeen = { id: frame.id, text: frame.text, at: Date.now() };
+  const repeat = lastSeen && lastSeen.id === frame.id && lastSeen.from === frame.from &&
+    lastSeen.text === frame.text && Date.now() - lastSeen.at < 60000;
+  lastSeen = { id: frame.id, from: frame.from, text: frame.text, at: Date.now() };
   if (!repeat) {
-    addMessage('in', frame.text, frame.broadcast ? 'broadcast' : undefined);
+    addMessage('in', frame.text, frame.broadcast ? 'broadcast' : undefined, frame.name);
     // Not available on iOS, where no browser exposes vibration.
     navigator.vibrate?.([120, 60, 120]);
   }
-  // Broadcasts go to many devices at once; their replies would collide.
-  if (!frame.broadcast) reply('ack', frame.id);
+  if (silent) return;
+  ranging = { id: frame.id, at: frame.at };
+  reply('ack', frame.id);
+}
+
+// Our own transmission, picked up by our own microphone. Once the receipt we
+// sent has been heard, the time between the message arriving and the receipt
+// leaving is known: send it, so the other side can work out the distance.
+function heardSelf(frame) {
+  selfHeard = frame;
+  if (frame.type !== 'ack') return;
+  if (ranging?.id === frame.id && ranging.at !== undefined && frame.at !== undefined) {
+    transmit(encodeRange(turnaroundMicros(ranging.at, frame.at))).catch(() => {});
+  }
+  ranging = null;
 }
 
 async function reply(type, id) {
-  await sleep(REPLY_DELAY);
-  transmit(encodeControl(type, id)).catch(() => {});
+  replying++;
+  try {
+    await sleep(REPLY_DELAY);
+    await transmit(encodeControl(type, id, deviceId));
+  } catch {
+    // The sender will ask again.
+  } finally {
+    replying--;
+  }
 }
 
 function receiver(sampleRate) {
   demod ??= new Demodulator(sampleRate, {
     onLevel: setLevel,
-    onSync() {
+    onSync(length, header) {
+      if (!LOOPBACK && header.from === deviceId) return;
       receiving = true;
       updateStatus();
     },
@@ -235,13 +417,15 @@ async function startListening() {
   rx.reset();
   const source = audio.createMediaStreamSource(stream);
   const tap = new AudioWorkletNode(audio, 'rx-tap', { channelCount: 1, channelCountMode: 'explicit' });
-  // Half-duplex: ignore the microphone while our own audio is playing.
-  tap.port.onmessage = (event) => { if (!transmitting) rx.push(event.data); };
+  // Our own audio is heard too: the distance to the other device is worked
+  // out from when each side hears itself and the other.
+  tap.port.onmessage = (event) => rx.push(event.data);
   // The graph only runs if it reaches the destination; keep that path silent.
   const silent = audio.createGain();
   silent.gain.value = 0;
   source.connect(tap).connect(silent).connect(audio.destination);
   mic = { stream, source, tap, silent };
+  announce('hello', 200, 600);
 }
 
 function stopListening() {
@@ -281,6 +465,7 @@ function transmit(frame) {
     }
     const audio = await audioContext();
     transmitting = true;
+    selfHeard = null;
     updateStatus();
     try {
       await play(audio, modulate(frame, audio.sampleRate));
@@ -288,7 +473,7 @@ function transmit(frame) {
       await sleep(200 + 1000 * (audio.outputLatency || 0));
     } finally {
       transmitting = false;
-      demod?.reset();
+      lastTransmit = Date.now();
       updateStatus();
     }
   };
@@ -298,9 +483,17 @@ function transmit(frame) {
 
 function receipt(id) {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve('timeout'), ACK_TIMEOUT);
+    const timer = setTimeout(() => resolve({ type: 'timeout' }), ACK_TIMEOUT);
     awaited = { id, resolve: (result) => { clearTimeout(timer); resolve(result); } };
   }).finally(() => { awaited = null; });
+}
+
+// The timing frame that follows a receipt, or null if it does not come.
+function rangeReport() {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), RANGE_TIMEOUT);
+    awaitedRange = (frame) => { clearTimeout(timer); resolve(frame); };
+  }).finally(() => { awaitedRange = null; });
 }
 
 let nextId = Math.floor(Math.random() * 256);
@@ -308,7 +501,7 @@ let nextId = Math.floor(Math.random() * 256);
 async function send(body, broadcast) {
   const id = nextId;
   nextId = (nextId + 1) % 256;
-  const frame = encodeFrame(body, id, broadcast);
+  const frame = encodeFrame(body, { id, from: deviceId, name, broadcast });
   const message = addMessage('out', body, 'sending');
   busy = true;
   updateComposer();
@@ -323,6 +516,7 @@ async function send(body, broadcast) {
     }
     updateStatus();
     let status = 'failed';
+    let acked = null;
     for (let attempt = 0; attempt < ATTEMPTS && status === 'failed'; attempt++) {
       if (attempt) {
         setStatus(message, 'retrying');
@@ -339,9 +533,24 @@ async function send(body, broadcast) {
         break;
       }
       if (!attempt) setStatus(message, 'waiting');
-      if (await receipt(id) === 'ack') status = 'delivered';
+      const answer = await receipt(id);
+      if (answer.type === 'ack') {
+        status = 'delivered';
+        acked = answer;
+      } else if (groupMode()) {
+        // More devices turned up while waiting; they will not send receipts.
+        status = 'broadcast';
+      }
     }
     setStatus(message, status);
+    if (acked && !LOOPBACK) {
+      const sent = selfHeard?.type === 'message' && selfHeard.id === id ? selfHeard.at : undefined;
+      const report = await rangeReport();
+      if (report && sent !== undefined && acked.at !== undefined) {
+        message.distance = distance(sent, acked.at, report.micros);
+        setStatus(message, status);
+      }
+    }
   } catch (error) {
     setStatus(message, 'failed');
     throw error;
@@ -355,10 +564,12 @@ async function send(body, broadcast) {
 // --- composer --------------------------------------------------------------
 
 function updateComposer() {
+  // The name and a separator travel in the same frame as the text.
+  const limit = MAX_BYTES - 1 - byteLength(name);
   const bytes = byteLength(text.value.trim());
-  $('count').textContent = `${bytes}/${MAX_BYTES}`;
-  $('count').classList.toggle('over', bytes > MAX_BYTES);
-  sendButton.disabled = busy || !bytes || bytes > MAX_BYTES;
+  $('count').textContent = `${bytes}/${limit}`;
+  $('count').classList.toggle('over', bytes > limit);
+  sendButton.disabled = busy || !name || !bytes || bytes > limit;
   text.style.height = 'auto';
   text.style.height = `${text.scrollHeight + 3}px`;
 }
@@ -385,7 +596,8 @@ $('composer').addEventListener('submit', async (event) => {
   text.value = '';
   showNotice('');
   try {
-    await send(body, $('broadcast').checked);
+    updateRoster();
+    await send(body, $('broadcast').checked || groupMode());
   } catch (error) {
     showNotice(describe(error));
   }
@@ -412,14 +624,36 @@ listenButton.addEventListener('click', async () => {
   updateStatus();
 });
 
+$('namer').addEventListener('submit', (event) => {
+  event.preventDefault();
+  const chosen = clipName($('name').value);
+  if (!chosen) return;
+  const changed = chosen !== name;
+  name = chosen;
+  store(localStorage, NAME_KEY, name);
+  showNamer(false);
+  updateComposer();
+  text.focus();
+  // Let devices already listening learn the new name.
+  if (changed && mic) announce('hello', 200, 600);
+});
+
+$('rename').addEventListener('click', () => {
+  $('name').value = name;
+  showNamer(true);
+});
+
 $('clear').addEventListener('click', () => {
   messages = [];
   saveMessages();
-  log.querySelectorAll('.msg').forEach((el) => el.remove());
+  log.querySelectorAll('.msg, .note').forEach((el) => el.remove());
   $('empty').hidden = false;
 });
 
+setInterval(updateRoster, 30000);
+
 loadMessages();
+showNamer(!name);
 updateStatus();
 updateComposer();
 

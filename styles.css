@@ -30,6 +30,8 @@
 
 * { box-sizing: border-box; }
 
+[hidden] { display: none !important; }
+
 html, body { height: 100%; }
 
 body {
@@ -42,7 +44,7 @@ body {
   padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
 
-button, textarea { font: inherit; color: inherit; }
+button, textarea, input { font: inherit; color: inherit; }
 
 .sr-only {
   position: absolute;
@@ -83,7 +85,7 @@ button, textarea { font: inherit; color: inherit; }
 }
 
 button:disabled { opacity: 0.45; cursor: default; }
-button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .status {
   display: flex;
@@ -119,6 +121,14 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
   transition: width 80ms linear;
 }
 
+.roster {
+  margin: 0;
+  padding: 0 16px 10px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 #log {
   flex: 1;
   min-height: 0;
@@ -150,6 +160,11 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
   overflow-wrap: anywhere;
   white-space: pre-wrap;
 }
+.msg b {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--accent);
+}
 .msg.out {
   align-self: flex-end;
   background: var(--accent);
@@ -175,6 +190,15 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
 }
 .msg[data-status="failed"] small { color: var(--warn); opacity: 1; font-weight: 600; }
 
+.note {
+  align-self: center;
+  max-width: 90%;
+  text-align: center;
+  font-size: 0.8rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .notice {
   margin: 0 16px 8px;
   padding: 10px 12px;
@@ -191,7 +215,7 @@ button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent);
   padding: 10px 16px 4px;
   border-top: 1px solid var(--border);
 }
-.composer textarea {
+.composer textarea, .composer input {
   flex: 1;
   min-width: 0;
   resize: none;
